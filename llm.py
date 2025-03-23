@@ -1,29 +1,34 @@
-import logging
-import json
+#!/usr/bin/env python
+"""
+NexusLLM - Automated Language Model with Feedback-Based Optimization
+"""
 import os
-from typing import Any, Dict, List, Optional, Tuple, Union
+import json
+import logging
+import time
+import threading
+from typing import Dict, List, Optional, Tuple, Any, Union
+from datetime import datetime
+from dataclasses import dataclass, field
+from collections import deque
+import random
+
+import numpy as np
 import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig, get_linear_schedule_with_warmup
 from sklearn.model_selection import train_test_split
-from datetime import datetime
 import optuna
-import random
-from collections import deque
 import requests
 from bs4 import BeautifulSoup
-import time
-import threading
-import numpy as np
-from dataclasses import dataclass, field
 
 # --- Configuration ---
 @dataclass
 class NexusConfig:
     # Model configuration
-    base_model_name: str = "google/flan-t5-xxl"
+    base_model_name: str = "google/flan-t5-small"  # Using smaller model for testing
     
     # Learning parameters
     learning_rate: float = 1e-5
@@ -40,26 +45,24 @@ class NexusConfig:
     # Training parameters
     evaluation_interval: int = 50
     batch_size: int = 4
-    max_input_length: int = 1536
-    train_test_split: float = 0.05
+    max_input_length: int = 512  # Reduced for efficiency
+    train_test_split: float = 0.2
     
     # Optimization parameters
     self_optimization_frequency: int = 100
-    hyperopt_max_evals: int = 15
+    hyperopt_max_evals: int = 5  # Reduced for testing
     optimization_metric: str = "val_loss"
-    min_feedback_for_retrain: int = 50
+    min_feedback_for_retrain: int = 10  # Reduced for testing
     performance_history_length: int = 30
     
     # Knowledge retrieval
     knowledge_apis: Dict[str, str] = field(default_factory=lambda: {
-        "semantic_scholar": "https://api.semanticscholar.org/graph/v1/paper/DOI:",
         "wikipedia": "https://en.wikipedia.org/w/api.php"
     })
     knowledge_update_frequency: int = 3600
     
     # Hardware settings
-    n_gpu: int = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device: torch.device = field(default_factory=lambda: torch.device("cuda" if torch.cuda.is_available() else "cpu"))
     
     # Generation parameters
     default_max_length: int = 300
@@ -69,7 +72,7 @@ class NexusConfig:
     
     def __post_init__(self):
         os.makedirs(self.model_pool_path, exist_ok=True)
-        os.makedirs(os.path.dirname(self.performance_log_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.performance_log_path) or '.', exist_ok=True)
 
 # --- Logging Module ---
 class LoggingManager:
@@ -113,7 +116,10 @@ class FeedbackDataset(Dataset):
         return len(self.prompts)
 
     def __getitem__(self, idx):
-        full_text = self.prompts[idx] + self.tokenizer.sep_token + self.responses[idx]
+        sep_token = self.tokenizer.sep_token if self.tokenizer.sep_token else " "
+        full_text = self.prompts[idx] + sep_token + self.responses[idx]
+        
+        # Handle different tokenizer return formats
         inputs = self.tokenizer(
             full_text,
             truncation=True,
@@ -122,11 +128,10 @@ class FeedbackDataset(Dataset):
             return_tensors='pt'
         )
         
-        return {
-            'input_ids': inputs['input_ids'].squeeze().to(self.device),
-            'attention_mask': inputs['attention_mask'].squeeze().to(self.device),
-            'labels': inputs['input_ids'].squeeze().to(self.device)
-        }
+        item = {k: v.squeeze().to(self.device) for k, v in inputs.items()}
+        item['labels'] = item['input_ids'].clone()
+        
+        return item
 
 # --- Knowledge Retrieval Module ---
 class KnowledgeRetriever:
@@ -144,38 +149,12 @@ class KnowledgeRetriever:
         
     def extract_keywords(self, text: str, num_keywords: int = 5) -> List[str]:
         """Extract relevant keywords from text for knowledge retrieval"""
-        # Simple implementation - in production would use NLP techniques
         words = text.lower().split()
         # Filter out common stopwords
         stopwords = {"the", "a", "an", "in", "on", "at", "to", "for", "with", "by", "about", "like"}
         keywords = [word for word in words if word not in stopwords and len(word) > 3]
         return keywords[:num_keywords]
         
-    def retrieve_from_semantic_scholar(self, query: str) -> Optional[str]:
-        """Retrieve knowledge from Semantic Scholar API"""
-        if query in self.cache:
-            return self.cache[query]
-            
-        try:
-            response = requests.get(self.config.knowledge_apis["semantic_scholar"] + query, timeout=5)
-            response.raise_for_status()
-            data = response.json()
-            
-            if data and 'abstract' in data:
-                result = data['abstract']
-            elif data and 'title' in data and 'authors' in data:
-                authors = ", ".join([author['name'] for author in data['authors']])
-                result = f"Title: {data['title']}, Authors: {authors}"
-            else:
-                return None
-                
-            self.cache[query] = result
-            return result
-            
-        except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-            self.logger.warning(f"Error during Semantic Scholar knowledge retrieval: {e}")
-            return None
-            
     def retrieve_from_wikipedia(self, query: str) -> Optional[str]:
         """Retrieve knowledge from Wikipedia API"""
         if query in self.cache:
@@ -222,15 +201,8 @@ class KnowledgeRetriever:
         if not keywords:
             return None
             
-        # Try each keyword with each knowledge source
+        # Try each keyword with Wikipedia
         for keyword in keywords:
-            # Try Semantic Scholar first
-            knowledge = self.retrieve_from_semantic_scholar(keyword)
-            if knowledge:
-                self.update_last_time()
-                return knowledge
-                
-            # Then try Wikipedia
             knowledge = self.retrieve_from_wikipedia(keyword)
             if knowledge:
                 self.update_last_time()
@@ -313,16 +285,27 @@ class ModelManager:
             self.tokenizer = AutoTokenizer.from_pretrained(self.config.base_model_name)
             
             # Ensure tokenizer has required special tokens
-            special_tokens = {'pad_token': '[PAD]', 'sep_token': '[SEP]'}
+            special_tokens = {}
             if self.tokenizer.pad_token is None:
-                self.tokenizer.add_special_tokens(special_tokens)
+                special_tokens['pad_token'] = '[PAD]'
+            if self.tokenizer.sep_token is None:
+                special_tokens['sep_token'] = '[SEP]'
                 
+            if special_tokens:
+                self.tokenizer.add_special_tokens({'additional_special_tokens': list(special_tokens.values())})
+                
+            # Load model configuration
+            model_config = AutoConfig.from_pretrained(self.config.base_model_name)
+            
+            # Load model
             self.model = AutoModelForCausalLM.from_pretrained(
-                self.config.base_model_name
+                self.config.base_model_name,
+                config=model_config
             ).to(self.config.device)
             
             # Resize token embeddings if we added tokens
-            self.model.resize_token_embeddings(len(self.tokenizer))
+            if special_tokens:
+                self.model.resize_token_embeddings(len(self.tokenizer))
             
             self.logger.info(f"Model '{self.config.base_model_name}' loaded successfully on {self.config.device}")
             
@@ -524,28 +507,34 @@ class ModelManager:
             self.model.eval()
             
             # Generate
-            outputs = self.model.generate(
-                inputs,
-                max_length=max_length,
-                num_return_sequences=1,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                do_sample=True,
-            )
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    inputs,
+                    max_length=max_length,
+                    num_return_sequences=1,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    do_sample=True,
+                )
             
             generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # Clean up response
+            response = generated_text.replace(prompt, "").strip()
+            if not response:
+                response = generated_text  # Fallback to full text if prompt stripping removes everything
             
             # Restore model to training mode
             self.model.train()
             
-            return generated_text
+            return response
             
         except Exception as e:
             self.logger.error(f"Error during text generation: {e}")
-            return f"Error: An unexpected error occurred during text generation."
+            return f"Error: An unexpected error occurred during text generation: {str(e)}"
 
 # --- Hyperparameter Optimization ---
 class HyperparameterOptimizer:
@@ -642,7 +631,7 @@ class NexusLLM:
         self.interaction_count = 0
         self._optimization_running = False
         
-        self.logger.info("Omnitide Nexus LLM Initialized Successfully")
+        self.logger.info("NexusLLM Initialized Successfully")
         
     def generate(self, prompt: str) -> str:
         """Generate text response for a prompt"""
@@ -742,13 +731,13 @@ class NexusLLM:
     def run(self):
         """Run interactive loop for the LLM"""
         self.logger.info("Starting interactive session")
-        print("Omnitide Nexus LLM Interactive Session (Type 'exit' to quit)")
+        print("NexusLLM Interactive Session (Type 'exit' to quit)")
         
         while True:
             try:
                 user_prompt = input("\nYour prompt: ")
                 if user_prompt.lower() == 'exit':
-                    print("Exiting Nexus LLM session. Goodbye!")
+                    print("Exiting NexusLLM session. Goodbye!")
                     break
                     
                 print("\nGenerating response...")
@@ -770,8 +759,432 @@ class NexusLLM:
             except Exception as e:
                 self.logger.error(f"Error in interactive loop: {e}")
                 print(f"An error occurred: {e}")
+                
+#!/usr/bin/env python3
+"""
+Nexus LLM Dependencies Installer
+-------------------------------
+This utility installs all required dependencies for the Nexus LLM system.
+"""
 
-# --- Main Application Entry Point ---
+import subprocess
+import sys
+import os
+import platform
+import shutil
+from typing import List, Dict, Tuple, Optional
+import argparse
+
+# Configuration
+REQUIRED_PACKAGES = [
+    "torch",
+    "transformers",
+    "scikit-learn",
+    "optuna",
+    "requests",
+    "beautifulsoup4",
+    "numpy",
+    "dataclasses"
+]
+
+CUDA_PACKAGES = {
+    "torch": "torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118"
+}
+
+class InstallerConfig:
+    def __init__(self):
+        self.verbose = False
+        self.cuda = False
+        self.venv_path = "nexus_env"
+        self.upgrade = False
+        self.requirements_file = "requirements.txt"
+        self.skip_cuda_check = False
+        self.force_cpu = False
+
+class ColorOutput:
+    """Class to handle colored terminal output"""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+    @staticmethod
+    def disable_colors():
+        """Disable colors for non-compatible terminals"""
+        ColorOutput.HEADER = ''
+        ColorOutput.BLUE = ''
+        ColorOutput.GREEN = ''
+        ColorOutput.YELLOW = ''
+        ColorOutput.RED = ''
+        ColorOutput.ENDC = ''
+        ColorOutput.BOLD = ''
+        ColorOutput.UNDERLINE = ''
+    
+    @staticmethod
+    def success(msg: str) -> str:
+        return f"{ColorOutput.GREEN}✓ {msg}{ColorOutput.ENDC}"
+    
+    @staticmethod
+    def error(msg: str) -> str:
+        return f"{ColorOutput.RED}✗ {msg}{ColorOutput.ENDC}"
+    
+    @staticmethod
+    def warning(msg: str) -> str:
+        return f"{ColorOutput.YELLOW}⚠ {msg}{ColorOutput.ENDC}"
+    
+    @staticmethod
+    def info(msg: str) -> str:
+        return f"{ColorOutput.BLUE}→ {msg}{ColorOutput.ENDC}"
+    
+    @staticmethod
+    def header(msg: str) -> str:
+        return f"{ColorOutput.HEADER}{ColorOutput.BOLD}{msg}{ColorOutput.ENDC}"
+
+class DependencyInstaller:
+    """Handles the installation of Python dependencies for Nexus LLM"""
+    
+    def __init__(self, config: InstallerConfig):
+        self.config = config
+        self.pip_path = None
+        self.python_path = None
+        
+        # Initialize colors
+        if platform.system() == "Windows" and not self._is_ansi_terminal():
+            ColorOutput.disable_colors()
+    
+    def _is_ansi_terminal(self) -> bool:
+        """Check if terminal supports ANSI colors"""
+        return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+    
+    def print_header(self):
+        """Print installer header"""
+        print("\n" + "=" * 60)
+        print(ColorOutput.header("NEXUS LLM DEPENDENCY INSTALLER"))
+        print("=" * 60 + "\n")
+    
+    def print_step(self, step: str, total_steps: int, current_step: int):
+        """Print current installation step"""
+        print(f"\n{ColorOutput.BOLD}[{current_step}/{total_steps}] {step}{ColorOutput.ENDC}")
+    
+    def check_prerequisites(self) -> bool:
+        """Check if prerequisites are met"""
+        # Check Python version
+        python_version = sys.version.split()[0]
+        min_version = "3.8.0"
+        
+        if self._version_is_less(python_version, min_version):
+            print(ColorOutput.error(f"Python version {python_version} detected. Nexus LLM requires Python {min_version} or higher."))
+            return False
+        
+        print(ColorOutput.success(f"Python {python_version} detected."))
+        
+        # Check pip installation
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "--version"], check=True, capture_output=True)
+            print(ColorOutput.success("Pip is installed."))
+        except (subprocess.SubprocessError, FileNotFoundError):
+            print(ColorOutput.error("Pip is not installed. Please install pip first."))
+            return False
+        
+        # Check GPU availability if not skipped
+        if self.config.cuda and not self.config.skip_cuda_check and not self.config.force_cpu:
+            has_cuda = self._check_cuda()
+            if has_cuda:
+                print(ColorOutput.success("CUDA is available. Will install GPU-accelerated packages."))
+            else:
+                print(ColorOutput.warning("CUDA not detected. Falling back to CPU-only packages."))
+                self.config.cuda = False
+        
+        return True
+    
+    def _version_is_less(self, current: str, minimum: str) -> bool:
+        """Compare version strings"""
+        current_parts = list(map(int, current.split('.')))
+        minimum_parts = list(map(int, minimum.split('.')))
+        
+        for i in range(max(len(current_parts), len(minimum_parts))):
+            current_part = current_parts[i] if i < len(current_parts) else 0
+            minimum_part = minimum_parts[i] if i < len(minimum_parts) else 0
+            
+            if current_part < minimum_part:
+                return True
+            elif current_part > minimum_part:
+                return False
+        
+        return False
+    
+    def _check_cuda(self) -> bool:
+        """Check for CUDA availability"""
+        try:
+            # Try to import torch and check CUDA
+            result = subprocess.run(
+                [sys.executable, "-c", "import torch; print(torch.cuda.is_available())"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            
+            if "True" in result.stdout:
+                return True
+            
+            # Alternative: Check for NVIDIA GPU
+            if platform.system() == "Windows":
+                try:
+                    nvidia_smi = subprocess.run(["where", "nvidia-smi"], capture_output=True, text=True, check=False)
+                    if nvidia_smi.returncode == 0:
+                        return True
+                except FileNotFoundError:
+                    pass
+            else:
+                try:
+                    nvidia_smi = subprocess.run(["which", "nvidia-smi"], capture_output=True, text=True, check=False)
+                    if nvidia_smi.returncode == 0:
+                        return True
+                except FileNotFoundError:
+                    pass
+                    
+            return False
+            
+        except Exception:
+            return False
+    
+    def create_virtual_environment(self) -> bool:
+        """Create virtual environment for Nexus LLM"""
+        if os.path.exists(self.config.venv_path):
+            print(ColorOutput.warning(f"Virtual environment already exists at '{self.config.venv_path}'."))
+            if not self.config.upgrade:
+                choice = input("Do you want to recreate it? (y/n): ").strip().lower()
+                if choice != 'y':
+                    # Use existing environment
+                    print(ColorOutput.info("Using existing virtual environment."))
+                    self._setup_venv_paths()
+                    return True
+            
+            # Delete existing environment
+            print(ColorOutput.info(f"Removing existing virtual environment at '{self.config.venv_path}'..."))
+            try:
+                shutil.rmtree(self.config.venv_path)
+            except Exception as e:
+                print(ColorOutput.error(f"Failed to remove existing environment: {str(e)}"))
+                return False
+        
+        # Create new environment
+        try:
+            print(ColorOutput.info(f"Creating virtual environment at '{self.config.venv_path}'..."))
+            subprocess.run([sys.executable, "-m", "venv", self.config.venv_path], check=True)
+            print(ColorOutput.success("Virtual environment created successfully."))
+            
+            self._setup_venv_paths()
+            return True
+            
+        except subprocess.SubprocessError as e:
+            print(ColorOutput.error(f"Failed to create virtual environment: {str(e)}"))
+            return False
+    
+    def _setup_venv_paths(self):
+        """Set up paths to Python and pip in the virtual environment"""
+        if platform.system() == "Windows":
+            self.python_path = os.path.join(self.config.venv_path, "Scripts", "python.exe")
+            self.pip_path = os.path.join(self.config.venv_path, "Scripts", "pip.exe")
+        else:
+            self.python_path = os.path.join(self.config.venv_path, "bin", "python")
+            self.pip_path = os.path.join(self.config.venv_path, "bin", "pip")
+    
+    def upgrade_pip(self) -> bool:
+        """Upgrade pip in the virtual environment"""
+        try:
+            print(ColorOutput.info("Upgrading pip to the latest version..."))
+            subprocess.run([self.pip_path, "install", "--upgrade", "pip"], check=True)
+            print(ColorOutput.success("Pip upgraded successfully."))
+            return True
+        except subprocess.SubprocessError as e:
+            print(ColorOutput.error(f"Failed to upgrade pip: {str(e)}"))
+            return False
+    
+    def create_requirements_file(self) -> bool:
+        """Create requirements.txt file"""
+        try:
+            print(ColorOutput.info(f"Creating {self.config.requirements_file}..."))
+            
+            requirements = []
+            for package in REQUIRED_PACKAGES:
+                if self.config.cuda and package in CUDA_PACKAGES:
+                    requirements.append(CUDA_PACKAGES[package])
+                else:
+                    requirements.append(package)
+            
+            with open(self.config.requirements_file, "w") as f:
+                for req in requirements:
+                    f.write(f"{req}\n")
+            
+            print(ColorOutput.success(f"{self.config.requirements_file} created successfully."))
+            return True
+        except Exception as e:
+            print(ColorOutput.error(f"Failed to create requirements file: {str(e)}"))
+            return False
+    
+    def install_requirements(self) -> bool:
+        """Install requirements from requirements.txt"""
+        try:
+            print(ColorOutput.info(f"Installing packages from {self.config.requirements_file}..."))
+            
+            install_cmd = [self.pip_path, "install", "-r", self.config.requirements_file]
+            if self.config.upgrade:
+                install_cmd.append("--upgrade")
+            
+            process = subprocess.Popen(
+                install_cmd,
+                stdout=subprocess.PIPE if not self.config.verbose else None,
+                stderr=subprocess.PIPE if not self.config.verbose else None,
+                universal_newlines=True
+            )
+            
+            if self.config.verbose:
+                print("\n")
+            else:
+                print(ColorOutput.info("Installing packages (this may take a while)..."))
+            
+            # Wait for process to complete
+            process.wait()
+            
+            if process.returncode != 0:
+                if not self.config.verbose and process.stderr:
+                    print(ColorOutput.error(f"Installation output: {process.stderr.read()}"))
+                print(ColorOutput.error(f"Failed to install packages. Return code: {process.returncode}"))
+                return False
+            
+            print(ColorOutput.success("All packages installed successfully."))
+            return True
+            
+        except Exception as e:
+            print(ColorOutput.error(f"Failed to install packages: {str(e)}"))
+            return False
+    
+    def verify_installation(self) -> bool:
+        """Verify package installation by importing them"""
+        print(ColorOutput.info("Verifying package installation..."))
+        
+        imports_to_check = {
+            "torch": "import torch; print(f'PyTorch {torch.__version__} installed (\\'GPU available: {torch.cuda.is_available()}\\')')",
+            "transformers": "import transformers; print(f'Transformers {transformers.__version__} installed')",
+            "sklearn": "import sklearn; print(f'Scikit-learn {sklearn.__version__} installed')",
+            "optuna": "import optuna; print(f'Optuna {optuna.__version__} installed')",
+            "requests": "import requests; print(f'Requests {requests.__version__} installed')",
+            "bs4": "import bs4; print(f'BeautifulSoup4 {bs4.__version__} installed')",
+            "numpy": "import numpy as np; print(f'NumPy {np.__version__} installed')",
+            "dataclasses": "import dataclasses; print('Dataclasses module installed')"
+        }
+        
+        all_successful = True
+        
+        for package, import_code in imports_to_check.items():
+            try:
+                result = subprocess.run(
+                    [self.python_path, "-c", import_code],
+                    capture_output=True,
+                    text=True,
+                    check=False
+                )
+                
+                if result.returncode == 0:
+                    print(ColorOutput.success(result.stdout.strip()))
+                else:
+                    print(ColorOutput.error(f"Failed to import {package}: {result.stderr.strip()}"))
+                    all_successful = False
+                    
+            except Exception as e:
+                print(ColorOutput.error(f"Error checking {package}: {str(e)}"))
+                all_successful = False
+        
+        if all_successful:
+            print(ColorOutput.success("\nAll packages verified successfully!"))
+        else:
+            print(ColorOutput.warning("\nSome packages could not be verified. Please check the output above."))
+        
+        return all_successful
+    
+    def show_activation_instructions(self):
+        """Show instructions for activating the virtual environment"""
+        print("\n" + "=" * 60)
+        print(ColorOutput.header("INSTALLATION COMPLETE"))
+        print("=" * 60)
+        
+        print("\nTo activate the Nexus LLM environment:\n")
+        
+        if platform.system() == "Windows":
+            print(ColorOutput.info(f"  {self.config.venv_path}\\Scripts\\activate"))
+        else:
+            print(ColorOutput.info(f"  source {self.config.venv_path}/bin/activate"))
+        
+        print("\nAfter activation, you can run Nexus LLM from your project directory.")
+        print("=" * 60 + "\n")
+    
+    def run(self) -> bool:
+        """Run the complete installation process"""
+        self.print_header()
+        
+        steps = [
+            ("Checking prerequisites", self.check_prerequisites),
+            ("Creating virtual environment", self.create_virtual_environment),
+            ("Upgrading pip", self.upgrade_pip),
+            ("Creating requirements file", self.create_requirements_file),
+            ("Installing packages", self.install_requirements),
+            ("Verifying installation", self.verify_installation)
+        ]
+        
+        for i, (step_name, step_func) in enumerate(steps, 1):
+            self.print_step(step_name, len(steps), i)
+            if not step_func():
+                print(ColorOutput.error(f"\nInstallation failed at step {i}: {step_name}"))
+                return False
+        
+        self.show_activation_instructions()
+        return True
+
+def parse_arguments() -> InstallerConfig:
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Nexus LLM Dependencies Installer")
+    
+    parser.add_argument("--venv", dest="venv_path", default="nexus_env",
+                        help="Virtual environment path (default: nexus_env)")
+    
+    parser.add_argument("--cuda", action="store_true", 
+                        help="Install CUDA-enabled packages")
+    
+    parser.add_argument("--cpu", action="store_true", dest="force_cpu",
+                        help="Force CPU-only packages even if CUDA is available")
+    
+    parser.add_argument("--upgrade", action="store_true",
+                        help="Upgrade existing packages")
+    
+    parser.add_argument("--skip-cuda-check", action="store_true",
+                        help="Skip CUDA availability check")
+    
+    parser.add_argument("--verbose", action="store_true",
+                        help="Show detailed output during installation")
+    
+    args = parser.parse_args()
+    
+    config = InstallerConfig()
+    config.venv_path = args.venv_path
+    config.cuda = args.cuda
+    config.upgrade = args.upgrade
+    config.verbose = args.verbose
+    config.skip_cuda_check = args.skip_cuda_check
+    config.force_cpu = args.force_cpu
+    
+    return config
+
+def main():
+    """Main function"""
+    config = parse_arguments()
+    installer = DependencyInstaller(config)
+    success = installer.run()
+    sys.exit(0 if success else 1)
+
 if __name__ == "__main__":
-    nexus_llm = NexusLLM()
-    nexus_llm.run()
+    main()
